@@ -9,13 +9,25 @@
   DOSBox Staging and ScummVM, per-game configs, and a shelf that looks like it belongs in this century.
 </p>
 
-RetroShelf is a desktop library and launcher for DOS and SCUMM games you already own. It turns a folder of game installs into a browsable shelf with box art, screenshots, metadata, play time, and a Play button. It does not sell, download, or bundle games.
+## The 3-minute pitch
 
-Point RetroShelf at the folders where your games live. It scans them, matches each folder against a curated DOS catalog, and decides whether the game should run in DOSBox Staging or ScummVM. For DOSBox games it generates a per-game config from an era profile covering CPU, memory, video, sound, MIDI, shader, and scaling, then lets you override any field. Metadata and artwork come from MobyGames, Wikipedia, LaunchBox, libretro, and the Internet Archive; everything is cached locally. Launching is one click, and play time is tracked automatically.
+> Structured with the WHAC method from Brant Pinvidic's *The 3-Minute Rule*: What is it? How does it work? Are you sure? Can you do it?
+
+### 0:00–1:30 — Conceptualize: What is it, and how does it work?
+
+**What is it?** RetroShelf is a desktop library and launcher for DOS and SCUMM games you already own. It turns a folder of game installs into a browsable shelf with box art, screenshots, metadata, play time, and a Play button. It does not sell, download, or bundle games.
+
+**How does it work?** Point RetroShelf at the folders where your games live. It scans them, matches each folder against a curated DOS catalog, and decides whether the game should run in DOSBox Staging or ScummVM. For DOSBox games it generates a per-game config from an era profile covering CPU, memory, video, sound, MIDI, shader, and scaling, then lets you override any field. Metadata and artwork come from MobyGames, Wikipedia, LaunchBox, libretro, and the Internet Archive; everything is cached locally. Launching is one click, and play time is tracked automatically.
+
+### 1:30–2:30 — Contextualize: Are you sure?
 
 The hard part of retro gaming is not finding the games. It is getting each one to run. DOSBox configs are a pile of cycles, memory, sound, and mount settings that change from title to title. RetroShelf puts that knowledge into a curated catalog and a readable tuning panel instead of another wiki page.
 
 It uses the emulators people already trust, keeps your games and library data on your machine, and writes plain DOSBox Staging configs and readable JSON. There is no account, no telemetry, and no lock-in. The project is MIT-licensed and ships with tests covering scanning, config generation, metadata parsing, game matching, and store behavior. The library screenshot above is a real 80-game collection.
+
+### 2:30–3:00 — Actualize: Can you do it?
+
+Yes. Build it yourself with one command:
 
 ```sh
 npm run build
