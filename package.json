@@ -7,6 +7,7 @@
   "author": "velkymx",
   "license": "MIT",
   "scripts": {
+    "build": "node build.mjs",
     "start": "electron-forge start",
     "build:renderer": "vite build --config vite.renderer.config.mjs",
     "test": "node --test",

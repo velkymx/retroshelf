@@ -31,7 +31,7 @@ module.exports = {
     icon: 'build/icon',
     // Only the app code ships; tests, icon sources and the renderer sources (built into
     // dist/renderer) stay out of the bundle.
-    ignore: [/^\/test(\/|$)/, /^\/build(\/|$)/, /^\/forge\.config\.js$/, /^\/vite\.renderer\.config\.mjs$/, /^\/src\/renderer(\/|$)/],
+    ignore: [/^\/test(\/|$)/, /^\/build(\/|$)/, /^\/build\.mjs$/, /^\/forge\.config\.js$/, /^\/vite\.renderer\.config\.mjs$/, /^\/src\/renderer(\/|$)/],
   },
   rebuildConfig: {},
   makers: [
