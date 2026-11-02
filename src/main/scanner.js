@@ -15,7 +15,7 @@ const NON_GAME = /^(install|winstall|_install|setup|setsound|setmuse|config|conf
 const AUXILIARY = /^(demo|intro|trainer|cheat|nosound|save|feed|patch|update|unpack|extract|dearj|pkunpak|pkunzip|pkzip|arj|unzip|lha|stmopn\w*|snoop\w*|order|register|credits|thanks|test|diag|checksys|sfx)$/i;
 // Batch files whose job is to start the Windows build of an emulator (or cmd.exe),
 // not a DOS program. Running one inside DOSBox always fails.
-const HOST_LAUNCHER = /\b(?:dosbox(?:-staging)?|scummvm)(?:\.exe)?\b|%~?dp0\b|%cd%|\bcmd(?:\.exe)?\b|\bstart\s+(?:""\s+)?(?:[A-Za-z]:|%|\/)|\bcd\s+\/[dD]\b/i;
+const HOST_LAUNCHER = /%~?dp0|%cd%|%comspec%/i;
 // Generic entry-point names: plausible, but weaker than a name that matches the title.
 const LAUNCHER_NAME = /^(start|run|play|go|game|runme|launch)$/i;
 // Common names for a game's real main program.
@@ -138,26 +138,106 @@ function inlineCommands(line) {
   return out;
 }
 
+/** The program a batch line would run, ignoring call/start prefixes, titles and shell keywords. */
+function firstCommandToken(line) {
+  let l = line.trim().replace(/^@/, '');
+  if (!l || /^(?:(?:echo|rem|if|for|goto|set|shift)\b|::|#)/i.test(l)) return '';
+  if (/^call\s+/i.test(l)) {
+    l = l.replace(/^call\s+/i, '');
+  } else if (/^start(?:\s|$)/i.test(l)) {
+    l = l.replace(/^start(?:\s+|$)/i, '');
+    l = l.replace(/^\/d\s+(?:"[^"]*"|\S+)\s+/i, '');
+    l = l.replace(/^(?:\/[a-z]+\s+)+/i, '');
+    l = l.replace(/^""\s*/, '');
+    const title = l.match(/^"([^"]*)"\s+(?=\S)/);
+    // `start "Title" program` uses the first quoted argument as a window title;
+    // a quoted path (or program name) is the program itself.
+    if (title && !/[\\/]/.test(title[1]) && !/\.(?:exe|com|bat)$/i.test(title[1])) l = l.slice(title[0].length);
+  }
+  const m = l.match(/^"([^"]+)"|^(\S+)/);
+  return m ? (m[1] || m[2]).replace(/^"|"$/g, '') : '';
+}
+
+/** True when a line actually runs DOSBox, not merely mentions it in an echo/rem/if. */
+function isDosboxCommand(line) {
+  const token = firstCommandToken(line);
+  if (!token) return false;
+  const base = path.basename(token.replace(/\\/g, '/')).toLowerCase();
+  return /^dosbox(?:-staging|-x)?(?:\.exe)?$/.test(base);
+}
+
+/** True when a batch starts a Windows emulator/cmd instead of a DOS program. */
+function isHostLauncher(text) {
+  if (HOST_LAUNCHER.test(text)) return true;
+  for (const raw of text.replace(/\r/g, '').split('\n')) {
+    if (/^\s*@?(?:call\s+)?start\s/i.test(raw)) return true;
+    if (/^\s*@?(?:call\s+)?cd\s+\/[dD]\b/i.test(raw)) return true;
+    const token = firstCommandToken(raw);
+    if (!token) continue;
+    const base = path.basename(token.replace(/\\/g, '/')).toLowerCase();
+    if (/^(?:cmd|dosbox(?:-staging|-x)?|scummvm)(?:\.exe)?$/.test(base)) return true;
+  }
+  return false;
+}
+
 /**
  * Find each DOSBox launch in a Windows wrapper and the working directory in effect.
- * GOG/eXoDOS-style launchers often `cd DOSBOX` first, so their relative `-conf`,
- * `-c` and `mount` paths are relative to that subfolder, not the game folder.
+ * GOG/eXoDOS-style launchers often `cd`/`pushd` first, so their relative `-conf`,
+ * `-c` and `mount` paths are relative to that folder, not the game folder.
  */
 function dosboxRuns(dir, text) {
   const runs = [];
+  const stack = [];
+  const driveCwds = new Map();
   let cwd = dir;
-  // Windows cmd expands these before DOSBox sees them.
-  const expand = (s) => s.replace(/%~dp0/gi, `${dir}${path.sep}`).replace(/%cd%/gi, cwd);
+  const remember = () => {
+    const m = /^([A-Za-z]):/.exec(cwd);
+    if (m) driveCwds.set(m[1].toUpperCase(), cwd);
+  };
+  const setCwd = (next) => {
+    cwd = next;
+    remember();
+  };
+  // Use function replacers: folder names may contain `$&`, `$1` or `$$`.
+  const expand = (s) => s.replace(/%~dp0/gi, () => dir + path.sep).replace(/%cd%/gi, () => cwd);
+  remember();
+
   for (const raw of text.replace(/\r/g, '').split('\n')) {
     const line = raw.trim();
-    if (!line || /^(rem|::|#)/i.test(line)) continue;
-    const cd = line.match(/^@?(?:cd|chdir)\s+(?:\/d\s+)?("?)([^"&|]+)\1/i);
-    if (cd) {
-      const target = expand(cd[2].trim());
-      if (target && !target.includes('%')) cwd = path.resolve(cwd, target.replace(/\\/g, '/'));
+    if (!line || /^(?:rem|::|#)/i.test(line)) continue;
+
+    const pushd = line.match(/^@?pushd\s+(.*)$/i);
+    if (pushd) {
+      const target = expand(pushd[1].trim().replace(/^"|"$/g, ''));
+      if (target && !target.includes('%')) {
+        stack.push(cwd);
+        setCwd(path.resolve(cwd, target.replace(/\\/g, '/')));
+      }
       continue;
     }
-    if (!/dosbox/i.test(line)) continue;
+    if (/^@?popd\b/i.test(line)) {
+      if (stack.length) setCwd(stack.pop());
+      continue;
+    }
+
+    const cd = line.match(/^@?(?:cd|chdir)(?=\s|\.\.|[\\/]|$)(.*)$/i);
+    if (cd) {
+      let arg = cd[1].trim();
+      if (!arg || /^\/\?$/.test(arg)) continue;
+      arg = arg.replace(/^\/d(?:\s+|$)/i, '').replace(/^"|"$/g, '');
+      const target = expand(arg);
+      if (target && !target.includes('%')) setCwd(path.resolve(cwd, target.replace(/\\/g, '/')));
+      continue;
+    }
+
+    const drive = line.match(/^@?([A-Za-z]):\s*$/);
+    if (drive && process.platform === 'win32') {
+      const key = drive[1].toUpperCase();
+      setCwd(driveCwds.get(key) || `${key}:${path.sep}`);
+      continue;
+    }
+
+    if (!isDosboxCommand(line)) continue;
     const confFiles = [];
     const re = /-conf\s+"([^"]+)"|-conf\s+(\S+)/gi;
     let m;
@@ -174,60 +254,110 @@ function mergeMounts(primary, extra) {
   return [...byDrive.values()];
 }
 
-function mergeCommands(primary, extra) {
-  const seen = new Set(primary);
-  return [...primary, ...extra.filter((c) => !seen.has(c) && (seen.add(c), true))];
+const NON_LAUNCH = /^(?:echo|cls|pause|rem|exit|set|path|cd|chdir|mount|imgmount|shift|setlocal|endlocal|config|keyb|mode|mouse|doskey|break|verify|prompt|country|shell|device|devicehigh|buffers|files|fcbs|lastdrive|stacks|dos)$/;
+
+/** The program a command actually starts, or null for setup/mount/drive commands. */
+function launchBase(raw) {
+  const line = raw.trim();
+  if (!line) return null;
+  const token = firstCommandToken(line);
+  if (!token) return null;
+  // `cd..`, `cd\GAME` and `chdir\GAME` are directory changes without a space.
+  if (/^(?:cd|chdir)(?:\.\.|[\\/]|$)/i.test(token)) return null;
+  const base = path.basename(token.replace(/\\/g, '/')).replace(/\.[^.]+$/, '').toLowerCase();
+  if (NON_LAUNCH.test(base)) return null;
+  if (/^(?:loadfix|lh|loadhigh)$/.test(base)) {
+    // Only a loadfix/lh line with an actual program after it starts something.
+    const tokens = tokenize(line).map((t) => t.replace(/^@/, ''));
+    const program = tokens.slice(1).find((t) => /\.(exe|com|bat)$/i.test(t));
+    if (!program) return null;
+    return path.basename(program.replace(/\\/g, '/')).replace(/\.[^.]+$/, '').toLowerCase();
+  }
+  if (/^[a-z]:$/.test(base)) return null;
+  return base;
 }
 
-/** True when an autoexec actually starts something, not just mounts drives. */
+/** True when an autoexec actually starts something, not just mounts drives or changes directory. */
 function hasLaunchCommand(commands) {
-  return commands.some((c) => {
-    const line = c.trim().toLowerCase();
-    return line && !/^(?:@?echo|cls|pause|rem|exit|set|path|[a-z]:)$/.test(line) && !/^(?:mount|imgmount)\b/.test(line);
-  });
+  return commands.some((c) => launchBase(c) !== null);
 }
 
-/** Pre-made DOSBox bundles: a launcher .bat passing -conf/-c, or a dosbox.conf next to the game. */
-function detectDosboxBundle(dir, entries) {
-  let runs = [];
+/** True when the first program an autoexec starts is an installer/helper rather than the game. */
+function isAuxiliaryLaunch(commands) {
+  const base = commands.map(launchBase).find(Boolean);
+  return Boolean(base && (NON_GAME.test(base) || AUXILIARY.test(base)));
+}
+
+/** Parse one wrapper launch (conf files plus inline -c commands) into mounts and commands. */
+function parseBundleRun(run) {
+  let confAutoexec = [];
   const confFiles = [];
+  let hints = {};
+  for (const conf of run.confFiles) {
+    const text = readText(conf);
+    if (!text) continue;
+    confFiles.push(conf);
+    confAutoexec = confAutoexec.concat(extractAutoexec(text));
+    hints = { ...hints, ...parseBundleHints(text) };
+  }
+  const fromConf = parseAutoexec(confAutoexec, run.base);
+  const fromInline = parseAutoexec(run.inline, run.base);
+  const mounts = mergeMounts(fromConf.mounts, fromInline.mounts);
+  // The packaged config is the authority when it starts the game; inline -c commands
+  // are the fallback for wrappers that keep everything on the command line, or when
+  // the config only runs an installer/helper.
+  const confLaunch = hasLaunchCommand(fromConf.commands);
+  const inlineLaunch = hasLaunchCommand(fromInline.commands);
+  let commands = fromConf.commands;
+  if (!confLaunch || (isAuxiliaryLaunch(fromConf.commands) && inlineLaunch)) {
+    commands = fromInline.commands;
+  }
+  return { mounts, commands, hints, confFiles };
+}
+
+/**
+ * Pre-made DOSBox bundles: a launcher .bat passing -conf/-c, or a dosbox.conf next to the game.
+ * Several launchers can exist (Install.bat next to Play.bat), so pick the best single one
+ * instead of concatenating their commands.
+ */
+function detectDosboxBundle(dir, entries) {
+  const folderName = path.basename(dir);
+  const wrappers = [];
   for (const e of entries) {
     if (!e.isFile() || !/\.(?:bat|cmd)$/i.test(e.name)) continue;
+    const base = e.name.replace(/\.[^.]+$/, '').toLowerCase();
+    if (NON_GAME.test(base) || AUXILIARY.test(base)) continue;
     const text = readText(path.join(dir, e.name));
-    if (!/dosbox/i.test(text)) continue;
-    runs.push(...dosboxRuns(dir, text));
+    if (!text) continue;
+    const runs = dosboxRuns(dir, text);
+    if (runs.length === 0) continue;
+    wrappers.push({ name: e.name, score: scoreExecutable(e.name, folderName), runs });
   }
-  // A bare dosbox.conf next to the game (or next to the wrapper's cd target) is used
-  // only when no launcher supplies a config or inline commands.
-  if (!runs.some((r) => r.confFiles.length || r.inline.length)) {
-    for (const base of new Set([dir, ...runs.map((r) => r.base)])) {
-      const local = safeReaddir(base).find((e) => e.isFile() && /^dosbox.*\.conf$/i.test(e.name));
-      if (local) runs.push({ base, confFiles: [path.join(base, local.name)], inline: [] });
-    }
-  }
-  if (!runs.some((r) => r.confFiles.length || r.inline.length)) return null;
+  wrappers.sort((a, b) => b.score - a.score || a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 
-  let hints = {};
-  let mounts = [];
-  let commands = [];
-  for (const run of runs) {
-    let confAutoexec = [];
-    for (const conf of run.confFiles) {
-      const text = readText(conf);
-      if (!text) continue;
-      confFiles.push(conf);
-      confAutoexec = confAutoexec.concat(extractAutoexec(text));
-      hints = { ...hints, ...parseBundleHints(text) };
+  for (const wrapper of wrappers) {
+    // The last launch in a wrapper is the final one (some scripts launch DOSBox more than once).
+    for (const run of [...wrapper.runs].reverse()) {
+      const parsed = parseBundleRun(run);
+      if (parsed.mounts.length && hasLaunchCommand(parsed.commands) && !isAuxiliaryLaunch(parsed.commands)) return parsed;
     }
-    const fromConf = parseAutoexec(confAutoexec, run.base);
-    const fromInline = parseAutoexec(run.inline, run.base);
-    mounts = mergeMounts(mounts, mergeMounts(fromConf.mounts, fromInline.mounts));
-    // The packaged config is the authority when it already starts the game; inline -c
-    // commands are the fallback for wrappers that keep everything on the command line.
-    commands = mergeCommands(commands, fromConf.commands.length ? fromConf.commands : fromInline.commands);
   }
-  if (mounts.length === 0) return null;
-  return { mounts, commands, hints, confFiles };
+
+  // Fall back to a bare dosbox.conf next to the game or the wrapper's cd target.
+  const bases = new Set([dir]);
+  for (const wrapper of wrappers) for (const run of wrapper.runs) bases.add(run.base);
+  const confs = [];
+  for (const base of bases) {
+    for (const e of safeReaddir(base)) {
+      if (e.isFile() && /^dosbox.*\.conf$/i.test(e.name)) confs.push({ base, file: path.join(base, e.name) });
+    }
+  }
+  confs.sort((a, b) => b.file.toLowerCase().localeCompare(a.file.toLowerCase()));
+  for (const { base, file } of confs) {
+    const parsed = parseBundleRun({ base, confFiles: [file], inline: [] });
+    if (parsed.mounts.length && hasLaunchCommand(parsed.commands) && !isAuxiliaryLaunch(parsed.commands)) return parsed;
+  }
+  return null;
 }
 
 /** ScummVM bundles ship a scummvm.exe + ini, or just SCUMM data files. */
@@ -367,7 +497,7 @@ function rankExecutables(entries, folderName, dir) {
     for (const e of runnable) {
       if (!/\.bat$/i.test(e.name)) continue;
       const text = readText(path.join(dir, e.name));
-      if (HOST_LAUNCHER.test(text)) {
+      if (isHostLauncher(text)) {
         hostLaunchers.add(e.name);
         continue;
       }
@@ -407,10 +537,11 @@ function rankExecutables(entries, folderName, dir) {
     if (dir && launched.has(base) && !/\.bat$/i.test(name)) score += 25;
     return { name, score };
   });
-  // Hide host launchers while a real DOS program exists; keep them only as a last resort.
+  // Hide host launchers; if none of the runnable files is a DOS program, there is
+  // nothing safe to launch in DOSBox.
   const preferred = scored.filter((x) => !hostLaunchers.has(x.name));
-  const list = preferred.length ? preferred : scored;
-  return list
+  if (preferred.length === 0) return [];
+  return preferred
     .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
     .map((x) => x.name);
 }
