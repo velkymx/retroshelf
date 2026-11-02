@@ -1,7 +1,7 @@
 {
   "name": "retroshelf",
   "productName": "RetroShelf",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A local game library for DOS and SCUMM games, launched through DOSBox Staging and ScummVM with per-game optimized configs.",
   "main": "src/main/main.js",
   "author": "velkymx",
