@@ -36,6 +36,12 @@ test('parseAutoexec drops wrapper noise and resolves mounts relative to the bund
   assert.deepStrictEqual(parsed.commands, ['c:', 'blood']);
 });
 
+test('parseAutoexec keeps a Windows absolute mount path', { skip: process.platform !== 'win32' }, () => {
+  const parsed = parseAutoexec(['mount C "C:\\Games\\Doom"', 'c:', 'DOOM'], 'D:\\Other');
+  assert.deepStrictEqual(parsed.mounts, [{ drive: 'C', path: path.resolve('C:\\Games\\Doom'), kind: 'dir' }]);
+  assert.deepStrictEqual(parsed.commands, ['c:', 'DOOM']);
+});
+
 test('rankExecutables puts installers last and folder-named exes first', () => {
   const entries = ['INSTALL.EXE', 'SETUP.EXE', 'DOOM.EXE', 'DEICE.EXE', 'readme.exe'].map((name) => ({ name, isFile: () => true }));
   assert.strictEqual(rankExecutables(entries, 'Doom')[0], 'DOOM.EXE');
@@ -46,6 +52,70 @@ test('rankExecutables matches the game exe against a folder name with an article
   assert.strictEqual(rankExecutables(entries, "The Bard's Tale (1985)(Electronic Arts Inc)")[0], 'bard.exe');
 });
 
+test('rankExecutables ignores a Windows START.BAT that launches DOSBox', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\nstart "" "C:\\Program Files\\DOSBox Staging\\dosbox.exe" -c "mount c ." -c "GAME.EXE"\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Some Game', dir)[0], 'GAME.EXE');
+});
+
+test('rankExecutables follows a generic START.BAT to the single game it runs', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\nGAME.EXE\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Some Game', dir)[0], 'GAME.EXE');
+});
+
+test('rankExecutables uses the program a helper batch starts instead of the helper', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'nosound.bat'), '@S2.EXE LOWMEM HEAP_MIN_SIZE=4200000\r\n');
+  for (const f of ['s2.exe', 's2edit.exe', 'install.exe']) fs.writeFileSync(path.join(dir, f), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Settlers 2', dir)[0], 's2.exe');
+});
+
+test('rankExecutables keeps a DOS launcher batch but not a copy-only install script', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'disc.bat'), 'echo off\r\ncall drivers\\isound\r\ndwb\r\n');
+  fs.writeFileSync(path.join(dir, 'diska.bat'), 'copy game.exe %1\r\ncopy data.dat %1\r\n\x1a\x1a\r\n');
+  for (const f of ['dwb.exe', 'game.exe']) fs.writeFileSync(path.join(dir, f), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Discworld', dir)[0], 'disc.bat');
+});
+
+test('rankExecutables ignores a batch that cds into another install', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, '_bc.bat'), 'cd \\sierra\\BC\r\nSierra %1 %2 %3 %4 %5\r\n');
+  fs.writeFileSync(path.join(dir, 'sierra.exe'), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Black Cauldron', dir)[0], 'sierra.exe');
+});
+
+test('rankExecutables returns nothing when the only launchable file is a host launcher', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'START.BAT'), 'DOSBox.exe -c "mount c ." -c "GAME.EXE"\r\n');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.deepStrictEqual(rankExecutables(entries, 'Some Game', dir), []);
+});
+
+test('rankExecutables treats %~dp0GAME.EXE as a host launcher without needing the word DOSBox', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\n%~dp0GAME.EXE\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Some Game', dir)[0], 'GAME.EXE');
+});
+
+test('rankExecutables does not treat cmd in a rem line as a host launcher', () => {
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, 'Command.bat'), 'rem use cmd.exe for the Windows launcher\r\necho start the game\r\nGAME.EXE\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  assert.strictEqual(rankExecutables(entries, 'Toolbox', dir)[0], 'Command.bat');
+});
+
 test('isDos83 accepts short names and rejects long or spaced ones', () => {
   assert.ok(isDos83('WOLF3D'));
   assert.ok(!isDos83('CnC Red Alert'));
@@ -53,12 +123,16 @@ test('isDos83 accepts short names and rejects long or spaced ones', () => {
 });
 
 test('buildRawLaunch mounts the library root for 8.3 folders and the folder itself otherwise', () => {
-  const a = buildRawLaunch({ dir: '/lib/DOOM', root: '/lib', exe: 'DOOM.EXE', cdImages: [] });
-  assert.strictEqual(a.mounts[0].path, path.resolve('/lib'));
+  const lib = path.resolve('/lib');
+  const dir = path.join(lib, 'DOOM');
+  const a = buildRawLaunch({ dir, root: lib, exe: 'DOOM.EXE', cdImages: [] });
+  assert.strictEqual(a.mounts[0].path, lib);
   assert.deepStrictEqual(a.commands, ['C:', 'cd \\DOOM', 'DOOM']);
-  const b = buildRawLaunch({ dir: '/lib/Long Name Game', root: '/lib', exe: 'go.bat', cdImages: ['/lib/Long Name Game/cd.iso'] });
-  assert.strictEqual(b.mounts[0].path, '/lib/Long Name Game');
-  assert.deepStrictEqual(b.mounts[1], { drive: 'D', path: '/lib/Long Name Game/cd.iso', kind: 'image' });
+  const longDir = path.join(lib, 'Long Name Game');
+  const iso = path.join(longDir, 'cd.iso');
+  const b = buildRawLaunch({ dir: longDir, root: lib, exe: 'go.bat', cdImages: [iso] });
+  assert.strictEqual(b.mounts[0].path, longDir);
+  assert.deepStrictEqual(b.mounts[1], { drive: 'D', path: iso, kind: 'image' });
   assert.deepStrictEqual(b.commands, ['C:', 'call GO.BAT']);
 });
 
@@ -75,6 +149,155 @@ test('scanGameFolder detects ScummVM bundles from the launcher bat and ini', () 
   assert.strictEqual(g.launch.scummvm.gameId, 'tentacle');
   assert.strictEqual(g.launch.scummvm.dataPath, path.join(dir, 'tentacle'));
   assert.strictEqual(g.knownKey, 'day-of-the-tentacle');
+});
+
+test('scanGameFolder reads mount and start commands from a Windows DOSBox wrapper', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Some Game');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '.\\DOSBOX\\DOSBox.exe -c "mount c ." -c "c:" -c "GAME.EXE"\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'));
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'DOSBox.exe'), 'x');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: dir, kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder parses a wrapper that starts DOSBox with a window title', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Title Wrapper');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'game'));
+  fs.writeFileSync(path.join(dir, 'game', 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'START.BAT'), 'start "" ".\\DOSBOX\\DOSBox.exe" -conf ".\\DOSBOX\\dosbox.conf"\r\n');
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'dosbox.conf'), '[autoexec]\r\n@echo off\r\nmount C ".\\game"\r\nc:\r\nGAME.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: path.join(dir, 'game'), kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder resolves relative bundle paths from the wrapper\u2019s cd folder', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Lands of Lore');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'game'));
+  fs.writeFileSync(path.join(dir, 'game', 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\ncd DOSBOX\r\nDOSBox.exe -conf "dosbox.conf" -conf "dosbox_single.conf"\r\n');
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'dosbox_single.conf'), '[autoexec]\r\n@echo off\r\nmount C "..\\game"\r\nc:\r\nGAME.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: path.join(dir, 'game'), kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder expands %~dp0 in a Windows wrapper', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Wrapper Game');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'game'));
+  fs.writeFileSync(path.join(dir, 'game', 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\ncd /d "%~dp0"\r\n.\\DOSBOX\\DOSBox.exe -conf "%~dp0DOSBOX\\dosbox.conf"\r\n');
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'dosbox.conf'), '[autoexec]\r\n@echo off\r\nmount C ".\\game"\r\nc:\r\nGAME.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: path.join(dir, 'game'), kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder falls back to the game exe when a wrapper only mounts a drive', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Mount Only');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'START.BAT'), 'DOSBox.exe -c "mount c ."\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'raw');
+  assert.strictEqual(g.exe, 'GAME.EXE');
+});
+
+test('scanGameFolder picks the game wrapper when Install.bat sits next to Play.bat', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Some Game');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'Install.bat'), 'DOSBox.exe -c "mount c ." -c "c:" -c "INSTALL.EXE"\r\n');
+  fs.writeFileSync(path.join(dir, 'Play.bat'), 'DOSBox.exe -c "mount c ." -c "c:" -c "GAME.EXE"\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder prefers inline game commands over a config that only installs', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Some Game');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'Play.bat'), 'DOSBox.exe -conf "DOSBOX\\install.conf" -c "mount c ." -c "c:" -c "GAME.EXE"\r\n');
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'install.conf'), '[autoexec]\r\n@echo off\r\nmount C ".\\"\r\nc:\r\nINSTALL.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder expands %~dp0 when the folder name contains $', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Cash$$');
+  fs.mkdirSync(path.join(dir, 'DOSBOX'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'game'));
+  fs.writeFileSync(path.join(dir, 'game', 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'START.BAT'), '@echo off\r\ncd /d "%~dp0"\r\n.\\DOSBOX\\DOSBox.exe -conf "%~dp0DOSBOX\\dosbox.conf"\r\n');
+  fs.writeFileSync(path.join(dir, 'DOSBOX', 'dosbox.conf'), '[autoexec]\r\n@echo off\r\nmount C ".\\game"\r\nc:\r\nGAME.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: path.join(dir, 'game'), kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder tracks pushd, popd and cd.. in wrappers', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Nested');
+  fs.mkdirSync(path.join(dir, 'SUB'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'game'));
+  fs.writeFileSync(path.join(dir, 'game', 'GAME.EXE'), 'x');
+  fs.writeFileSync(path.join(dir, 'START.BAT'), [
+    '@echo off',
+    'pushd SUB',
+    'popd',
+    'cd SUB',
+    'cd..',
+    'DOSBox.exe -conf "dosbox.conf"',
+    '',
+  ].join('\r\n'));
+  fs.writeFileSync(path.join(dir, 'dosbox.conf'), '[autoexec]\r\n@echo off\r\nmount C ".\\game"\r\nc:\r\nGAME.EXE\r\n');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'bundle');
+  assert.deepStrictEqual(g.launch.dos.mounts, [{ drive: 'C', path: path.join(dir, 'game'), kind: 'dir' }]);
+  assert.deepStrictEqual(g.launch.dos.commands, ['c:', 'GAME.EXE']);
+});
+
+test('scanGameFolder ignores a wrapper that only changes directory', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Cd Only');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'START.BAT'), 'DOSBox.exe -c "mount c ." -c "cd GAME"\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'raw');
+  assert.strictEqual(g.exe, 'GAME.EXE');
+});
+
+test('scanGameFolder ignores a wrapper whose autoexec only loads a TSR', () => {
+  const root = tmpdir();
+  const dir = path.join(root, 'Tsr Only');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'START.BAT'), 'DOSBox.exe -c "mount c ." -c "loadfix"\r\n');
+  fs.writeFileSync(path.join(dir, 'GAME.EXE'), 'x');
+  const g = scanGameFolder(dir, root);
+  assert.strictEqual(g.source, 'raw');
+  assert.strictEqual(g.exe, 'GAME.EXE');
 });
 
 test('scanGameFolder uses the curated exe for known games', () => {
